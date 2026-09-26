@@ -1,128 +1,244 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { LogOut } from 'lucide-react';
-import Login from './components/Login';
-import Sidebar from './components/Sidebar';
-import type { Tab } from './components/Sidebar';
-import Overview from './components/Overview';
-import Nodes from './components/Nodes';
-import Policy from './components/Policy';
-import Objects from './components/Objects';
-import Toaster from './components/Toaster';
-import { ClusterStatusPill } from './components/StatusPill';
-import { ApiError, getOverview } from './api';
-import type { Overview as OverviewData } from './types';
-import { useToasts } from './hooks/useToasts';
+import { useRef, useState } from 'react';
+import type { ChangeEvent } from 'react';
+import { ApiError, deleteObject, downloadObject, headObject, putObject } from './api';
+import type { ObjectHead } from './api';
+import { formatBytes, shortHash } from './format';
 
 const TOKEN_KEY = 'vault:token';
-const POLL_INTERVAL_MS = 4000;
 
-const TAB_TITLES: Record<Tab, string> = {
-  overview: 'Overview',
-  objects: 'Objects',
-  nodes: 'Nodes',
-  policy: 'Policy',
-};
+type Busy = null | 'check' | 'upload' | 'download' | 'delete';
+type Message = { kind: 'success' | 'error' | 'info'; text: string };
 
 export default function App() {
-  const [token, setToken] = useState<string | null>(() => window.localStorage.getItem(TOKEN_KEY));
-  const [overview, setOverview] = useState<OverviewData | null>(null);
-  const [overviewError, setOverviewError] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>('overview');
-  const { toasts, push, dismiss } = useToasts();
-  const pollRef = useRef<number | null>(null);
+  const [token, setToken] = useState(() => window.localStorage.getItem(TOKEN_KEY) ?? '');
+  const [key, setKey] = useState('');
+  const [file, setFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState<Busy>(null);
+  const [progress, setProgress] = useState(0);
+  const [message, setMessage] = useState<Message | null>(null);
+  const [metadata, setMetadata] = useState<ObjectHead | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const logout = useCallback(
-    (message?: string) => {
-      window.localStorage.removeItem(TOKEN_KEY);
-      setToken(null);
-      setOverview(null);
-      if (message) push('error', message);
-    },
-    [push]
-  );
+  function rememberToken(value: string) {
+    setToken(value);
+    window.localStorage.setItem(TOKEN_KEY, value);
+  }
 
-  const refresh = useCallback(async () => {
-    if (!token) return;
-    try {
-      const data = await getOverview(token);
-      setOverview(data);
-      setOverviewError(null);
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 401) {
-        logout('Session expired — reconnect with a valid operator token.');
-        return;
-      }
-      setOverviewError(err instanceof Error ? err.message : 'Could not reach the Vault API.');
+  function onFileChange(e: ChangeEvent<HTMLInputElement>) {
+    const picked = e.target.files?.[0] ?? null;
+    setFile(picked);
+    if (picked && !key.trim()) setKey(picked.name);
+  }
+
+  function reportError(err: unknown, fallback: string) {
+    if (err instanceof ApiError && err.status === 401) {
+      setMessage({ kind: 'error', text: 'That token was rejected. Check the token and try again.' });
+      return;
     }
-  }, [token, logout]);
-
-  useEffect(() => {
-    if (!token) return;
-    refresh();
-    pollRef.current = window.setInterval(refresh, POLL_INTERVAL_MS);
-    return () => {
-      if (pollRef.current) window.clearInterval(pollRef.current);
-    };
-  }, [token, refresh]);
-
-  function handleConnect(newToken: string, initialOverview: OverviewData) {
-    window.localStorage.setItem(TOKEN_KEY, newToken);
-    setToken(newToken);
-    setOverview(initialOverview);
-    setOverviewError(null);
+    setMessage({ kind: 'error', text: err instanceof Error ? err.message : fallback });
   }
 
-  if (!token) {
-    return <Login onConnect={handleConnect} />;
+  async function handleCheck() {
+    const trimmedKey = key.trim();
+    if (!token.trim() || !trimmedKey) return;
+    setBusy('check');
+    setMetadata(null);
+    setMessage(null);
+    setConfirmDelete(false);
+    try {
+      const result = await headObject(token.trim(), trimmedKey);
+      if (result) {
+        setMetadata(result);
+        setMessage({ kind: 'success', text: `${trimmedKey} exists.` });
+      } else {
+        setMessage({ kind: 'info', text: `No object is stored at "${trimmedKey}" yet.` });
+      }
+    } catch (err) {
+      reportError(err, 'Could not check that key.');
+    } finally {
+      setBusy(null);
+    }
   }
+
+  async function handleUpload() {
+    const trimmedKey = key.trim();
+    if (!token.trim() || !trimmedKey || !file) return;
+    setBusy('upload');
+    setProgress(0);
+    setMessage(null);
+    setConfirmDelete(false);
+    try {
+      const manifest = await putObject(token.trim(), trimmedKey, file, setProgress);
+      setMetadata({
+        generation: String(manifest.generation),
+        sha256: manifest.sha256,
+        contentType: manifest.contentType,
+        size: manifest.size,
+      });
+      setMessage({
+        kind: 'success',
+        text: `Uploaded ${trimmedKey} (${manifest.replicas.length} replica${
+          manifest.replicas.length === 1 ? '' : 's'
+        }).`,
+      });
+      setFile(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    } catch (err) {
+      reportError(err, 'Upload failed.');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleDownload() {
+    const trimmedKey = key.trim();
+    if (!token.trim() || !trimmedKey) return;
+    setBusy('download');
+    setMessage(null);
+    setConfirmDelete(false);
+    try {
+      await downloadObject(token.trim(), trimmedKey);
+      setMessage({ kind: 'success', text: `Downloading ${trimmedKey}…` });
+    } catch (err) {
+      reportError(err, 'Download failed.');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleDelete() {
+    const trimmedKey = key.trim();
+    if (!token.trim() || !trimmedKey) return;
+    if (!confirmDelete) {
+      setConfirmDelete(true);
+      return;
+    }
+    setBusy('delete');
+    setMessage(null);
+    try {
+      await deleteObject(token.trim(), trimmedKey);
+      setMessage({ kind: 'success', text: `Deleted ${trimmedKey}.` });
+      setMetadata(null);
+    } catch (err) {
+      reportError(err, 'Delete failed.');
+    } finally {
+      setBusy(null);
+      setConfirmDelete(false);
+    }
+  }
+
+  const ready = token.trim().length > 0 && key.trim().length > 0;
 
   return (
-    <div className="shell">
-      <Sidebar tab={tab} onSelect={setTab} />
-      <div className="shell__main">
-        <header className="topbar">
-          <h1 className="topbar__title">{TAB_TITLES[tab]}</h1>
-          <div className="topbar__right">
-            {overview && <ClusterStatusPill state={overview.cluster.state} pulse />}
-            <button className="btn btn--ghost btn--small" onClick={() => logout()}>
-              <LogOut size={15} strokeWidth={1.75} />
-              Disconnect
-            </button>
+    <div className="page">
+      <div className="card">
+        <div className="brand">
+          <span className="brand__mark">V</span>
+          <div>
+            <div className="brand__name">Vault</div>
+            <div className="brand__sub">Object storage</div>
           </div>
-        </header>
-        <main className="content">
-          {tab === 'overview' && (
-            <Overview overview={overview} error={overviewError} onRetry={refresh} />
-          )}
-          {tab === 'objects' && (
-            <Objects
-              token={token}
-              pushToast={push}
-              onChanged={refresh}
-              onUnauthorized={() => logout('Session expired — reconnect with a valid operator token.')}
-            />
-          )}
-          {tab === 'nodes' && (
-            <Nodes
-              overview={overview}
-              token={token}
-              onChanged={refresh}
-              pushToast={push}
-              onUnauthorized={() => logout('Session expired — reconnect with a valid operator token.')}
-            />
-          )}
-          {tab === 'policy' && (
-            <Policy
-              overview={overview}
-              token={token}
-              onChanged={refresh}
-              pushToast={push}
-              onUnauthorized={() => logout('Session expired — reconnect with a valid operator token.')}
-            />
-          )}
-        </main>
+        </div>
+
+        <label className="field-label" htmlFor="token">
+          Operator token
+        </label>
+        <input
+          id="token"
+          type="password"
+          autoComplete="off"
+          spellCheck={false}
+          className="input input--mono"
+          placeholder="dev-vault-token"
+          value={token}
+          onChange={(e) => rememberToken(e.target.value)}
+        />
+
+        <label className="field-label" htmlFor="key">
+          Object key
+        </label>
+        <input
+          id="key"
+          type="text"
+          className="input input--mono"
+          placeholder="e.g. logs/archive.tar.gz"
+          value={key}
+          onChange={(e) => {
+            setKey(e.target.value);
+            setConfirmDelete(false);
+          }}
+        />
+
+        <label className="field-label" htmlFor="file">
+          File to upload
+        </label>
+        <input
+          id="file"
+          ref={fileInputRef}
+          type="file"
+          className="input"
+          onChange={onFileChange}
+        />
+        {file && (
+          <div className="file-chip">
+            <span className="mono">{file.name}</span>
+            <span className="file-chip__size">{formatBytes(file.size)}</span>
+          </div>
+        )}
+
+        {busy === 'upload' && (
+          <div className="progress">
+            <div className="progress__bar" style={{ width: `${progress}%` }} />
+          </div>
+        )}
+
+        <div className="button-row">
+          <button className="btn" disabled={!ready || busy !== null} onClick={handleCheck}>
+            {busy === 'check' ? 'Checking…' : 'Check'}
+          </button>
+          <button
+            className="btn btn--primary"
+            disabled={!ready || !file || busy !== null}
+            onClick={handleUpload}
+          >
+            {busy === 'upload' ? `Uploading… ${progress}%` : 'Upload'}
+          </button>
+          <button className="btn" disabled={!ready || busy !== null} onClick={handleDownload}>
+            {busy === 'download' ? 'Downloading…' : 'Download'}
+          </button>
+          <button
+            className={`btn btn--danger${confirmDelete ? ' btn--danger-confirm' : ''}`}
+            disabled={!ready || busy !== null}
+            onClick={handleDelete}
+          >
+            {busy === 'delete' ? 'Deleting…' : confirmDelete ? 'Confirm delete' : 'Delete'}
+          </button>
+        </div>
+
+        {message && <div className={`banner banner--${message.kind}`}>{message.text}</div>}
+
+        {metadata && (
+          <div className="meta-grid">
+            <div className="meta-field">
+              <div className="meta-field__label">Generation</div>
+              <div className="meta-field__value mono">{metadata.generation}</div>
+            </div>
+            <div className="meta-field">
+              <div className="meta-field__label">Size</div>
+              <div className="meta-field__value">{formatBytes(metadata.size)}</div>
+            </div>
+            <div className="meta-field">
+              <div className="meta-field__label">Content type</div>
+              <div className="meta-field__value">{metadata.contentType || '—'}</div>
+            </div>
+            <div className="meta-field">
+              <div className="meta-field__label">SHA-256</div>
+              <div className="meta-field__value mono">{shortHash(metadata.sha256)}</div>
+            </div>
+          </div>
+        )}
       </div>
-      <Toaster toasts={toasts} onDismiss={dismiss} />
     </div>
   );
 }

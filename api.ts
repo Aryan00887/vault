@@ -1,5 +1,3 @@
-import type { Manifest, NodeInfo, Overview, Policy } from './types';
-
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -26,47 +24,6 @@ function encodeKey(key: string): string {
 async function readErrorText(res: Response): Promise<string> {
   const text = (await res.text()).trim();
   return text || res.statusText || `Request failed (${res.status})`;
-}
-
-export async function getHealth(): Promise<{ status: string; uptimeSeconds: number }> {
-  const res = await fetch('/api/health');
-  if (!res.ok) throw new ApiError(res.status, await readErrorText(res));
-  return res.json();
-}
-
-export async function getOverview(token: string): Promise<Overview> {
-  const res = await fetch('/api/ops/overview', { headers: authHeaders(token) });
-  if (!res.ok) throw new ApiError(res.status, await readErrorText(res));
-  return res.json();
-}
-
-export async function getPolicy(token: string): Promise<Policy> {
-  const res = await fetch('/api/ops/policy', { headers: authHeaders(token) });
-  if (!res.ok) throw new ApiError(res.status, await readErrorText(res));
-  return res.json();
-}
-
-export async function putPolicy(token: string, policy: Policy): Promise<Policy> {
-  const res = await fetch('/api/ops/policy', {
-    method: 'PUT',
-    headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
-    body: JSON.stringify(policy),
-  });
-  if (!res.ok) throw new ApiError(res.status, await readErrorText(res));
-  return res.json();
-}
-
-export async function nodeAction(
-  token: string,
-  id: string,
-  action: 'drain' | 'restore'
-): Promise<NodeInfo[]> {
-  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/${action}`, {
-    method: 'POST',
-    headers: authHeaders(token),
-  });
-  if (!res.ok) throw new ApiError(res.status, await readErrorText(res));
-  return res.json();
 }
 
 export interface ObjectHead {
@@ -105,38 +62,37 @@ export async function downloadObject(token: string, key: string): Promise<void> 
   URL.revokeObjectURL(url);
 }
 
-export async function deleteObject(token: string, key: string, ifMatch?: string): Promise<void> {
-  const headers: Record<string, string> = { ...authHeaders(token) };
-  if (ifMatch) headers['If-Match'] = `"${ifMatch}"`;
-  const res = await fetch(`/api/objects/${encodeKey(key)}`, { method: 'DELETE', headers });
+export async function deleteObject(token: string, key: string): Promise<void> {
+  const res = await fetch(`/api/objects/${encodeKey(key)}`, {
+    method: 'DELETE',
+    headers: authHeaders(token),
+  });
   if (res.status === 404) throw new ApiError(404, 'No object exists at this key.');
   if (!res.ok) throw new ApiError(res.status, await readErrorText(res));
 }
 
-export interface PutOptions {
-  contentType?: string;
-  ifMatch?: string;
-  ifNoneMatch?: boolean;
-  onProgress?: (percent: number) => void;
+export interface Manifest {
+  key: string;
+  generation: number;
+  size: number;
+  sha256: string;
+  contentType: string;
+  replicas: string[];
 }
 
 export function putObject(
   token: string,
   key: string,
   file: File,
-  opts: PutOptions = {}
+  onProgress?: (percent: number) => void
 ): Promise<Manifest> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('PUT', `/api/objects/${encodeKey(key)}`);
     xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-    if (opts.contentType) xhr.setRequestHeader('Content-Type', opts.contentType);
-    if (opts.ifMatch) xhr.setRequestHeader('If-Match', `"${opts.ifMatch}"`);
-    if (opts.ifNoneMatch) xhr.setRequestHeader('If-None-Match', '*');
+    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
     xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable && opts.onProgress) {
-        opts.onProgress(Math.round((e.loaded / e.total) * 100));
-      }
+      if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
     };
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
